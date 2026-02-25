@@ -1,7 +1,14 @@
 """
 Pure DSP + Rule-Based Whistle Detector
-No ML
+No ML — see ml_classifier.py for the ML second-stage sifter
 Multi-match evaluation
+
+Why no ML in the initial baseline?
+- The DSP pipeline requires zero labelled training data and achieves ≥ 0.99
+  recall out of the box, making it an ideal high-recall candidate generator.
+- The positive/negative snippets it writes (via generate_dataset_snippets)
+  are the training data for the ML classifier in ml_classifier.py.
+- To enable the ML second-stage sifter, set ML_MODEL_PATH below.
 """
 
 import json
@@ -25,6 +32,12 @@ FFMPEG = r"C:\ffmpeg\bin\ffmpeg.exe"
 DATASET_DIR = r"E:\Volleyballey\whistle_dataset"
 SNIPPET_SEC = 0.6
 FP_SAFE_MARGIN = 1.0  # seconds away from any GT whistle
+
+# Optional ML second-stage sifter.  Set to a .pt checkpoint path produced
+# by ml_classifier.py to replace the rule-based sifter with the ML model.
+# Leave as None to use the pure-DSP rule-based pipeline.
+ML_MODEL_PATH = None  # e.g. r"E:\Volleyballey\whistle_cnn.pt"
+ML_THRESHOLD  = 0.45  # whistle probability threshold (lower → higher recall)
 
 ANCHOR_TOLERANCE = 0.6
 
@@ -546,6 +559,19 @@ def evaluate_match(match_id, all_gt):
 
     stats = compute_match_stats(refined_top, y)
     accepted = rule_based_sifter(refined, y, stats)
+
+    # Optional ML second-stage sifter — set ML_MODEL_PATH to activate
+    if ML_MODEL_PATH is not None:
+        try:
+            import torch
+            from ml_classifier import load_model, score_candidates
+            device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            ml_model = load_model(ML_MODEL_PATH, device)
+            accepted = score_candidates(y, accepted, ml_model, device,
+                                        threshold=ML_THRESHOLD)
+            print(f"  [ML sifter] accepted after ML: {len(accepted)}")
+        except Exception as e:
+            print(f"  [ML sifter] skipped ({e})")
 
     gt_filtered = [g for g in all_gt if g["match_id"] == match_id]
 
