@@ -34,8 +34,12 @@ class Config:
     sr: int = 22050
     n_fft: int = 2048
     hop: int = 128
+    # Narrow band for feature extraction / rule-based sifter
     whistle_low: float = 3700
     whistle_high: float = 4300
+    # Wider band for initial ROI detection (covers full referee whistle range)
+    whistle_low_wide: float = 2500
+    whistle_high_wide: float = 6000
     min_frames: int = 15
     max_gap_frames: int = 12
 
@@ -76,7 +80,10 @@ def detect_active_frames(y):
     mag = np.abs(S)
 
     freqs = librosa.fft_frequencies(sr=cfg.sr, n_fft=cfg.n_fft)
-    band_mask = (freqs >= cfg.whistle_low) & (freqs <= cfg.whistle_high)
+
+    # Use wider band (2.5–6 kHz) for initial ROI detection to cover full
+    # referee whistle frequency range and improve recall
+    band_mask = (freqs >= cfg.whistle_low_wide) & (freqs <= cfg.whistle_high_wide)
 
     band_mag = mag[band_mask]
     band_energy = band_mag.mean(axis=0)
@@ -87,16 +94,22 @@ def detect_active_frames(y):
     band_mean = np.mean(band_mag, axis=0)
     sharpness = band_peak / (band_mean + 1e-8)
 
+    # Spectral flux in the wide whistle band — high at onsets/whistles
+    band_diff = np.diff(band_mag, axis=1, prepend=band_mag[:, :1])
+    spectral_flux = np.sum(np.maximum(band_diff, 0), axis=0)
+
     # Normalize
     band_energy = (band_energy - np.median(band_energy)) / (np.std(band_energy) + 1e-8)
     sharpness = (sharpness - np.median(sharpness)) / (np.std(sharpness) + 1e-8)
     flatness = (flatness - np.median(flatness)) / (np.std(flatness) + 1e-8)
+    spectral_flux = (spectral_flux - np.median(spectral_flux)) / (np.std(spectral_flux) + 1e-8)
 
     band_energy = uniform_filter1d(band_energy, size=5)
     sharpness = uniform_filter1d(sharpness, size=5)
     flatness = uniform_filter1d(flatness, size=5)
+    spectral_flux = uniform_filter1d(spectral_flux, size=3)
 
-    score = 1.0 * band_energy + 1.0 * sharpness - 1.2 * flatness
+    score = 1.0 * band_energy + 1.0 * sharpness - 1.2 * flatness + 0.5 * spectral_flux
 
     START_TH = 0.75
     CONTINUE_TH = 0.25
@@ -192,14 +205,26 @@ def refine_candidates(y, detections):
         band_peak = mag[mask].max(axis=0)
         band_peak = uniform_filter1d(band_peak, size=5)
 
-        # Take robust center (top 5% strongest frames)
-        th = np.percentile(band_peak, 95)
-        strong_idxs = np.where(band_peak >= th)[0]
+        # Spectral flux onset within the narrow whistle band —
+        # more accurate onset centering than energy peak alone
+        band_seg = mag[mask]
+        band_diff = np.diff(band_seg, axis=1, prepend=band_seg[:, :1])
+        flux = np.sum(np.maximum(band_diff, 0), axis=0)
+        flux = uniform_filter1d(flux, size=3)
+
+        # Combine energy and flux for a robust center estimate:
+        # weight the flux toward finding the onset, energy for the body
+        combined = 0.5 * (band_peak / (band_peak.max() + 1e-8)) + \
+                   0.5 * (flux / (flux.max() + 1e-8))
+
+        # Take robust center (top 5% of combined score)
+        th = np.percentile(combined, 95)
+        strong_idxs = np.where(combined >= th)[0]
 
         if len(strong_idxs) > 0:
             center_frame = int(np.median(strong_idxs))
         else:
-            center_frame = int(np.argmax(band_peak))
+            center_frame = int(np.argmax(combined))
 
         t_peak = (s0 + center_frame * cfg.hop) / cfg.sr
 
@@ -284,6 +309,22 @@ def extract_window_features(y, start, end):
     band_mean = S_w.mean(axis=0) + 1e-8
     peak_prominence = np.mean(band_peak / band_mean)
 
+    # ------------------------------------------------
+    # Spectral flux in whistle band (positive half)
+    # High at onsets; whistles have a clear onset
+    # ------------------------------------------------
+    band_diff = np.diff(S_w, axis=1, prepend=S_w[:, :1])
+    spectral_flux = float(np.mean(np.sum(np.maximum(band_diff, 0), axis=0)))
+
+    # ------------------------------------------------
+    # Tonal stability: ratio of energy in the single
+    # dominant frequency bin vs the rest of the band.
+    # Whistles are near-pure tones → high tonal_ratio.
+    # ------------------------------------------------
+    mean_spectrum = S_w.mean(axis=1)
+    peak_bin_energy = mean_spectrum.max()
+    tonal_ratio = float(peak_bin_energy / (mean_spectrum.mean() + 1e-8))
+
     return {
         "band_ratio": band_ratio,
         "freq_std": freq_std,
@@ -291,6 +332,8 @@ def extract_window_features(y, start, end):
         "peak_prominence": peak_prominence,
         "band_energy": band_energy,
         "narrow_ratio": narrow_ratio,
+        "spectral_flux": spectral_flux,
+        "tonal_ratio": tonal_ratio,
     }
 
 def suppress_close_centers(detections, min_gap_sec=0.7):
@@ -340,12 +383,16 @@ def rule_based_sifter(detections, y, stats):
             #continue
 
         z_narrow = (feats["narrow_ratio"] - stats["narrow_ratio"]["median"]) / stats["narrow_ratio"]["std"]
+        z_flux = (feats["spectral_flux"] - stats["spectral_flux"]["median"]) / stats["spectral_flux"]["std"]
+        z_tonal = (feats["tonal_ratio"] - stats["tonal_ratio"]["median"]) / stats["tonal_ratio"]["std"]
 
         score = (
                 1.0 * z_band_ratio +
                 1.3 * z_prom +
                 1.0 * z_narrow -
-                0.8 * z_flat
+                0.8 * z_flat +
+                0.5 * z_flux +
+                0.6 * z_tonal
         )
 
         if score > -0.2:
@@ -437,6 +484,8 @@ def analyze_feature_distributions(detections, y, gt):
     summarize("flatness_band")
     summarize("peak_prominence")
     summarize("band_energy")
+    summarize("spectral_flux")
+    summarize("tonal_ratio")
 
 
 # ============================================================
